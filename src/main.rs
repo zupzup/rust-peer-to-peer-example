@@ -7,25 +7,18 @@ use libp2p::{
     noise::{Keypair, NoiseConfig, X25519Spec},
     swarm::{NetworkBehaviourEventProcess, Swarm, SwarmBuilder},
     tcp::TokioTcpConfig,
-    Multiaddr, NetworkBehaviour, PeerId, Transport,
+    NetworkBehaviour, PeerId, Transport,
 };
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use tokio::{fs, io::AsyncBufReadExt};
+use tokio::{fs, io::AsyncBufReadExt, sync::mpsc};
 
 static KEYS: Lazy<identity::Keypair> = Lazy::new(|| identity::Keypair::generate_ed25519());
-
 static PEER_ID: Lazy<PeerId> = Lazy::new(|| PeerId::from(KEYS.public()));
+static TOPIC: Lazy<Topic> = Lazy::new(|| Topic::new("recipes"));
 
-const TOPIC: &str = "recipes";
 const STORAGE_FILE_PATH: &str = "./recipes.json";
-
-#[derive(NetworkBehaviour)]
-struct RecipeBehaviour {
-    floodsub: Floodsub,
-    mdns: TokioMdns,
-}
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync + 'static>>;
 type Recipes = Vec<Recipe>;
@@ -53,40 +46,74 @@ struct ListRequest {
 #[derive(Debug, Serialize, Deserialize)]
 struct ListResponse {
     mode: ListMode,
-    data: Vec<Recipe>,
+    data: Recipes,
     receiver: String,
+}
+
+enum EventType {
+    Response(ListResponse),
+    Input(String),
+}
+
+#[derive(NetworkBehaviour)]
+struct RecipeBehaviour {
+    floodsub: Floodsub,
+    mdns: TokioMdns,
+    #[behaviour(ignore)]
+    response_sender: mpsc::UnboundedSender<ListResponse>,
 }
 
 impl NetworkBehaviourEventProcess<FloodsubEvent> for RecipeBehaviour {
     fn inject_event(&mut self, event: FloodsubEvent) {
         match event {
             FloodsubEvent::Message(msg) => {
-                if let Ok(req) = serde_json::from_slice::<ListRequest>(&msg.data) {
+                if let Ok(resp) = serde_json::from_slice::<ListResponse>(&msg.data) {
+                    if resp.receiver == PEER_ID.to_string() {
+                        println!("Response from {}:", msg.source);
+                        resp.data.iter().for_each(|r| println!("{:?}", r));
+                    }
+                } else if let Ok(req) = serde_json::from_slice::<ListRequest>(&msg.data) {
                     match req.mode {
                         ListMode::ALL => {
                             println!("Received ALL req: {:?} from {:?}", req, msg.source);
-                            match read_local_recipes().await { // TODO: how to do async stuff here, tokio::spawn?
-                                Ok(recipes) => {
-                                    // TODO: send back
-                                }
-                                Err(e) => eprintln!("error fetching local recipes to answer ALL request");
-                            }
+                            respond_with_public_recipes(
+                                self.response_sender.clone(),
+                                msg.source.to_string(),
+                            );
                         }
                         ListMode::One(ref peer_id) => {
                             if peer_id == &PEER_ID.to_string() {
                                 println!("Received req: {:?} from {:?}", req, msg.source);
+                                respond_with_public_recipes(
+                                    self.response_sender.clone(),
+                                    msg.source.to_string(),
+                                );
                             }
                         }
-                    }
-                } else if let Ok(resp) = serde_json::from_slice::<ListResponse>(&msg.data) {
-                    if resp.receiver == PEER_ID.to_string() {
-                        println!("Received resp: {:?} from {:?}", resp, msg.source);
                     }
                 }
             }
             _ => (),
         }
     }
+}
+
+fn respond_with_public_recipes(sender: mpsc::UnboundedSender<ListResponse>, receiver: String) {
+    tokio::spawn(async move {
+        match read_local_recipes().await {
+            Ok(recipes) => {
+                let resp = ListResponse {
+                    mode: ListMode::ALL,
+                    receiver,
+                    data: recipes.into_iter().filter(|r| r.public).collect(),
+                };
+                if let Err(e) = sender.send(resp) {
+                    eprintln!("error sending response via channel, {}", e);
+                }
+            }
+            Err(e) => eprintln!("error fetching local recipes to answer ALL request, {}", e),
+        }
+    });
 }
 
 impl NetworkBehaviourEventProcess<MdnsEvent> for RecipeBehaviour {
@@ -156,12 +183,11 @@ async fn write_local_recipes(recipes: &Recipes) -> Result<()> {
 #[tokio::main]
 async fn main() {
     println!("Peer Id: {}", PEER_ID.clone());
+    let (response_sender, mut response_rcv) = mpsc::unbounded_channel();
 
     let auth_keys = Keypair::<X25519Spec>::new()
         .into_authentic(&KEYS)
         .expect("can create auth keys");
-
-    let topic = Topic::new(TOPIC);
 
     let transp = TokioTcpConfig::new()
         .upgrade(upgrade::Version::V1)
@@ -172,21 +198,16 @@ async fn main() {
     let mut behaviour = RecipeBehaviour {
         floodsub: Floodsub::new(PEER_ID.clone()),
         mdns: TokioMdns::new().expect("can create mdns"),
+        response_sender,
     };
 
-    behaviour.floodsub.subscribe(topic.clone());
+    behaviour.floodsub.subscribe(TOPIC.clone());
 
     let mut swarm = SwarmBuilder::new(transp, behaviour, PEER_ID.clone())
         .executor(Box::new(|fut| {
             tokio::spawn(fut);
         }))
         .build();
-
-    if let Some(to_dial) = std::env::args().nth(1) {
-        let addr: Multiaddr = to_dial.parse().expect("provide a valid addr");
-        Swarm::dial_addr(&mut swarm, addr).expect("can connect to given node");
-        println!("Dialed {:?}", to_dial)
-    }
 
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
 
@@ -201,92 +222,98 @@ async fn main() {
     loop {
         let evt = {
             tokio::select! {
-                line = stdin.next_line() => Some(line.expect("can get line").expect("can read line from stdin")),
+                line = stdin.next_line() => Some(EventType::Input(line.expect("can get line").expect("can read line from stdin"))),
                 event = swarm.next() => {
-                    println!("Swarm Event: {:?}", event);
+                    println!("Unhandled Swarm Event: {:?}", event);
                     None
-                }
+                },
+                response = response_rcv.recv() => Some(EventType::Response(response.expect("response exists"))),
             }
         };
-        if let Some(line) = evt {
-            match line.as_str() {
-                "ls p" => {
-                    println!("Discovered Peers:");
-                    let nodes = swarm.mdns.discovered_nodes();
-                    let mut unique_peers = HashSet::new();
-                    for peer in nodes {
-                        unique_peers.insert(peer);
-                    }
-                    unique_peers.iter().for_each(|p| println!("{}", p));
-                }
-                cmd if cmd.starts_with("ls r ") => {
-                    let rest = cmd.strip_prefix("ls r ");
-                    match rest {
-                        Some("all") => {
-                            let req = ListRequest {
-                                mode: ListMode::ALL,
-                            };
-                            let json = serde_json::to_string(&req).expect("can jsonify request");
-                            swarm.floodsub.publish(topic.clone(), json.as_bytes());
 
-                            println!("waiting for responses...");
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                            println!("end of waiting");
-                        }
-                        Some(recipes_peer_id) => {
-                            let req = ListRequest {
-                                mode: ListMode::One(recipes_peer_id.to_owned()),
-                            };
-                            let json = serde_json::to_string(&req).expect("can jsonify request");
-                            swarm.floodsub.publish(topic.clone(), json.as_bytes());
-
-                            println!("waiting for response...");
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                            println!("end of waiting");
-                        }
-                        None => {
-                            match read_local_recipes().await {
-                                Ok(v) => {
-                                    println!("Local Recipes ({})", v.len());
-                                    v.iter().for_each(|r| println!("{:?}", r));
-                                }
-                                Err(e) => eprintln!("error fetching local recipes: {}", e),
-                            };
-                        }
-                    };
+        if let Some(event) = evt {
+            match event {
+                EventType::Response(resp) => {
+                    let json = serde_json::to_string(&resp).expect("can jsonify response");
+                    swarm.floodsub.publish(TOPIC.clone(), json.as_bytes());
                 }
-                cmd if cmd.starts_with("create r") => {
-                    if let Some(rest) = cmd.strip_prefix("create r") {
-                        let elements: Vec<&str> = rest.split("|").collect();
-                        if elements.len() < 3 {
-                            println!("too few arguments - Format: name|ingredients|instructions");
-                        } else {
-                            let name = elements.get(0).expect("name is there");
-                            let ingredients = elements.get(1).expect("ingredients is there");
-                            let instructions = elements.get(2).expect("instructions is there");
-                            if let Err(e) = create_new_recipe(name, ingredients, instructions).await
-                            {
-                                eprintln!("error creating recipe: {}", e);
-                            };
+                EventType::Input(line) => match line.as_str() {
+                    "ls p" => {
+                        println!("Discovered Peers:");
+                        let nodes = swarm.mdns.discovered_nodes();
+                        let mut unique_peers = HashSet::new();
+                        for peer in nodes {
+                            unique_peers.insert(peer);
                         }
+                        unique_peers.iter().for_each(|p| println!("{}", p));
                     }
-                }
-                cmd if cmd.starts_with("publish r") => {
-                    if let Some(rest) = cmd.strip_prefix("publish r") {
-                        match rest.trim().parse::<usize>() {
-                            Ok(id) => {
-                                if let Err(e) = publish_recipe(id).await {
-                                    println!("error publishing recipe with id {}, {}", id, e)
-                                } else {
-                                    println!("Published Recipe with id: {}", id);
-                                }
+                    cmd if cmd.starts_with("ls r") => {
+                        let rest = cmd.strip_prefix("ls r ");
+                        match rest {
+                            Some("all") => {
+                                let req = ListRequest {
+                                    mode: ListMode::ALL,
+                                };
+                                let json =
+                                    serde_json::to_string(&req).expect("can jsonify request");
+                                swarm.floodsub.publish(TOPIC.clone(), json.as_bytes());
                             }
-                            Err(e) => eprintln!("invalid id: {}, {}", rest.trim(), e),
+                            Some(recipes_peer_id) => {
+                                println!("requesting from {}", recipes_peer_id);
+                                let req = ListRequest {
+                                    mode: ListMode::One(recipes_peer_id.to_owned()),
+                                };
+                                let json =
+                                    serde_json::to_string(&req).expect("can jsonify request");
+                                swarm.floodsub.publish(TOPIC.clone(), json.as_bytes());
+                            }
+                            None => {
+                                match read_local_recipes().await {
+                                    Ok(v) => {
+                                        println!("Local Recipes ({})", v.len());
+                                        v.iter().for_each(|r| println!("{:?}", r));
+                                    }
+                                    Err(e) => eprintln!("error fetching local recipes: {}", e),
+                                };
+                            }
                         };
                     }
-                }
-                _ => eprintln!("unexpected command"),
-            };
+                    cmd if cmd.starts_with("create r") => {
+                        if let Some(rest) = cmd.strip_prefix("create r") {
+                            let elements: Vec<&str> = rest.split("|").collect();
+                            if elements.len() < 3 {
+                                println!(
+                                    "too few arguments - Format: name|ingredients|instructions"
+                                );
+                            } else {
+                                let name = elements.get(0).expect("name is there");
+                                let ingredients = elements.get(1).expect("ingredients is there");
+                                let instructions = elements.get(2).expect("instructions is there");
+                                if let Err(e) =
+                                    create_new_recipe(name, ingredients, instructions).await
+                                {
+                                    eprintln!("error creating recipe: {}", e);
+                                };
+                            }
+                        }
+                    }
+                    cmd if cmd.starts_with("publish r") => {
+                        if let Some(rest) = cmd.strip_prefix("publish r") {
+                            match rest.trim().parse::<usize>() {
+                                Ok(id) => {
+                                    if let Err(e) = publish_recipe(id).await {
+                                        println!("error publishing recipe with id {}, {}", id, e)
+                                    } else {
+                                        println!("Published Recipe with id: {}", id);
+                                    }
+                                }
+                                Err(e) => eprintln!("invalid id: {}, {}", rest.trim(), e),
+                            };
+                        }
+                    }
+                    _ => eprintln!("unknown command"),
+                },
+            }
         }
     }
 }
