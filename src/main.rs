@@ -1,8 +1,9 @@
 use libp2p::{
     core::upgrade,
     floodsub::{Floodsub, FloodsubEvent, Topic},
+    futures::StreamExt,
     identity,
-    mdns::{MdnsEvent, TokioMdns},
+    mdns::{Mdns, MdnsEvent},
     mplex,
     noise::{Keypair, NoiseConfig, X25519Spec},
     swarm::{NetworkBehaviourEventProcess, Swarm, SwarmBuilder},
@@ -59,7 +60,7 @@ enum EventType {
 #[derive(NetworkBehaviour)]
 struct RecipeBehaviour {
     floodsub: Floodsub,
-    mdns: TokioMdns,
+    mdns: Mdns,
     #[behaviour(ignore)]
     response_sender: mpsc::UnboundedSender<ListResponse>,
 }
@@ -200,7 +201,9 @@ async fn main() {
 
     let mut behaviour = RecipeBehaviour {
         floodsub: Floodsub::new(PEER_ID.clone()),
-        mdns: TokioMdns::new().expect("can create mdns"),
+        mdns: Mdns::new(Default::default())
+            .await
+            .expect("can create mdns"),
         response_sender,
     };
 
@@ -226,11 +229,11 @@ async fn main() {
         let evt = {
             tokio::select! {
                 line = stdin.next_line() => Some(EventType::Input(line.expect("can get line").expect("can read line from stdin"))),
-                event = swarm.next() => {
+                response = response_rcv.recv() => Some(EventType::Response(response.expect("response exists"))),
+                event = swarm.select_next_some() => {
                     info!("Unhandled Swarm Event: {:?}", event);
                     None
                 },
-                response = response_rcv.recv() => Some(EventType::Response(response.expect("response exists"))),
             }
         };
 
@@ -238,7 +241,10 @@ async fn main() {
             match event {
                 EventType::Response(resp) => {
                     let json = serde_json::to_string(&resp).expect("can jsonify response");
-                    swarm.floodsub.publish(TOPIC.clone(), json.as_bytes());
+                    swarm
+                        .behaviour_mut()
+                        .floodsub
+                        .publish(TOPIC.clone(), json.as_bytes());
                 }
                 EventType::Input(line) => match line.as_str() {
                     "ls p" => handle_list_peers(&mut swarm).await,
@@ -254,7 +260,7 @@ async fn main() {
 
 async fn handle_list_peers(swarm: &mut Swarm<RecipeBehaviour>) {
     info!("Discovered Peers:");
-    let nodes = swarm.mdns.discovered_nodes();
+    let nodes = swarm.behaviour().mdns.discovered_nodes();
     let mut unique_peers = HashSet::new();
     for peer in nodes {
         unique_peers.insert(peer);
@@ -270,14 +276,20 @@ async fn handle_list_recipes(cmd: &str, swarm: &mut Swarm<RecipeBehaviour>) {
                 mode: ListMode::ALL,
             };
             let json = serde_json::to_string(&req).expect("can jsonify request");
-            swarm.floodsub.publish(TOPIC.clone(), json.as_bytes());
+            swarm
+                .behaviour_mut()
+                .floodsub
+                .publish(TOPIC.clone(), json.as_bytes());
         }
         Some(recipes_peer_id) => {
             let req = ListRequest {
                 mode: ListMode::One(recipes_peer_id.to_owned()),
             };
             let json = serde_json::to_string(&req).expect("can jsonify request");
-            swarm.floodsub.publish(TOPIC.clone(), json.as_bytes());
+            swarm
+                .behaviour_mut()
+                .floodsub
+                .publish(TOPIC.clone(), json.as_bytes());
         }
         None => {
             match read_local_recipes().await {
